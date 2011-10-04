@@ -18,6 +18,7 @@ try:
     import simplejson as json
 except ImportError:
     import json
+from Crypto.Cipher import AES
 import mimetypes
 import os
 import re
@@ -49,6 +50,42 @@ from swift.common.constraints import check_metadata, check_object_creation, \
     MAX_CONTAINER_NAME_LENGTH, MAX_FILE_SIZE
 from swift.common.exceptions import ChunkReadTimeout, \
     ChunkWriteTimeout, ConnectionTimeout
+
+
+'''For encryption to be on the user must specify a key in the configuration file
+[app:proxy-server]
+use = egg:swift#proxy
+allow_account_management = true
+key = <your key>
+'''
+
+
+
+'''(tony)Encrypt function that performs AES encryption. AES encryption needs a block
+size divisible by 16 so spaces are used to pad incoming bytes. '''
+def encrypt(plain, key):
+    mode = AES.MODE_CBC
+    encryptor = AES.new(key, mode)
+    ENCRYPTION_BLOCK_SIZE = 16
+    mod = len(plain) % ENCRYPTION_BLOCK_SIZE
+    if(mod != 0):
+        '''pad with spaces to make it divisible by the block_size'''
+        plain = plain + ' ' * (ENCRYPTION_BLOCK_SIZE - mod)
+    cipher = encryptor.encrypt(plain)
+    return cipher
+
+'''(tony)AES decryption function that takes in cipher text assuming spaced padding
+at the end.'''
+def decrypt(cipher, key):
+    plain = cipher
+    mode = AES.MODE_CBC
+    ENCRYPTION_BLOCK_SIZE = 16
+    if len(cipher) and not (len(cipher) % ENCRYPTION_BLOCK_SIZE):
+        decryptor = AES.new(key, mode)
+        plain = decryptor.decrypt(cipher)
+        '''remove padding'''
+        plain = plain.rstrip(' ')
+    return plain
 
 
 def update_headers(response, headers):
@@ -645,15 +682,13 @@ class Controller(object):
                 possible_source.status in (200, 206)) or \
                     200 <= possible_source.status <= 399:
                 if newest:
+                    ts = 0
                     if source:
                         ts = float(source.getheader('x-put-timestamp') or
                                    source.getheader('x-timestamp') or 0)
-                        pts = float(
-                            possible_source.getheader('x-put-timestamp') or
-                            possible_source.getheader('x-timestamp') or 0)
-                        if pts > ts:
-                            source = possible_source
-                    else:
+                    pts = float(possible_source.getheader('x-put-timestamp') or
+                                possible_source.getheader('x-timestamp') or 0)
+                    if pts > ts:
                         source = possible_source
                     continue
                 else:
@@ -671,7 +706,6 @@ class Controller(object):
             if req.method == 'GET' and source.status in (200, 206):
                 res = Response(request=req, conditional_response=True)
                 res.bytes_transferred = 0
-
                 def file_iter():
                     try:
                         while True:
@@ -716,6 +750,11 @@ class Controller(object):
         return self.best_response(req, statuses, reasons, bodies,
                                   '%s %s' % (server_type, req.method))
 
+'''(tony) method to print dictionaries in a way that is
+easy to read in the server log'''
+def printdict(d):
+            for k, v in d.iteritems():
+                print k + ' : ' + str(v)
 
 class ObjectController(Controller):
     """WSGI controller for object requests."""
@@ -821,7 +860,13 @@ class ObjectController(Controller):
                             yield obj
                         marker = sublisting[-1]['name']
 
-                resp = Response(headers=resp.headers, request=req,
+                headers = {
+                    'X-Object-Manifest': resp.headers['x-object-manifest'],
+                    'Content-Type': resp.content_type}
+                for key, value in resp.headers.iteritems():
+                    if key.lower().startswith('x-object-meta-'):
+                        headers[key] = value
+                resp = Response(headers=headers, request=req,
                                 conditional_response=True)
                 if req.method == 'HEAD':
                     # These shenanigans are because webob translates the HEAD
@@ -855,15 +900,54 @@ class ObjectController(Controller):
                     content_length = 0
                     last_modified = resp.last_modified
                     etag = md5().hexdigest()
-                resp = Response(headers=resp.headers, request=req,
+                headers = {
+                    'X-Object-Manifest': resp.headers['x-object-manifest'],
+                    'Content-Type': resp.content_type,
+                    'Content-Length': content_length,
+                    'ETag': etag}
+                for key, value in resp.headers.iteritems():
+                    if key.lower().startswith('x-object-meta-'):
+                        headers[key] = value
+                resp = Response(headers=headers, request=req,
                                 conditional_response=True)
                 resp.app_iter = SegmentedIterable(self, lcontainer, listing,
                                                   resp)
                 resp.content_length = content_length
                 resp.last_modified = last_modified
-                resp.etag = etag
             resp.headers['accept-ranges'] = 'bytes'
+        '''(tony) return the response header here if encrytion is off'''
+        if not self.app.encrypt:
+            return resp
+        iter = resp.app_iter
+        def decrypt_iter():
+            for chunk in iter:
+                chunk = decrypt(chunk, self.app.key)
+                yield chunk
+        '''change the resp's iter to the decrypt iter defined above'''
+        resp.app_iter = decrypt_iter()
 
+        '''(tony)Update content-length to = the original-content-length and update
+        the etag to = the original etag. We do this since both these change
+        when decryption is used.'''
+        nheaders = dict()
+        encrypted_resp = False
+        headers = resp.headers.iteritems()
+        for key, value in headers:
+            if key == 'x-object-meta-ocl':
+                encrypted_resp = True
+                nheaders['Content-Length'] = value
+            elif key == 'x-object-meta-oet':
+                nheaders['etag'] = value
+            elif key != 'Content-Length' and key != 'etag':
+                nheaders[key] = value
+        if encrypted_resp:
+            print '*****************************************************************'
+            print '--Updating response headers for decryption length changes from:--'
+            printdict(resp.headers)
+            print '---------------------New Response Headers----------------------'
+            printdict(nheaders)
+            print '---------------------------------------------------------------'
+        resp.headers = nheaders
         return resp
 
     @public
@@ -1058,14 +1142,36 @@ class ObjectController(Controller):
             req = new_req
         node_iter = self.iter_nodes(partition, nodes, self.app.object_ring)
         pile = GreenPile(len(nodes))
+        encrypted_put = False
+        print_encrypt_off   = False
         for container in containers:
             nheaders = dict(req.headers.iteritems())
+            if self.app.encrypt and 'Content-Length' in nheaders:
+                if int(nheaders['Content-Length']) > 0:
+                    #tony
+                    '''here is the case when encryption is on and we know fixed
+                    data is being sent ie the content-length header was used.
+                    We need to remove the content-length to trick the object
+                    server into calculating its own content-length. This way
+                    the encrypted length is calculated on the server'''
+                    encrypted_put = True
+                    del nheaders['Content-Length']
+                    nheaders['Transfer-Encoding'] = 'chunked'
+            elif 'Content-Length' in nheaders:
+                print_encrypt_off = True
             nheaders['X-Container-Host'] = '%(ip)s:%(port)s' % container
             nheaders['X-Container-Partition'] = container_partition
             nheaders['X-Container-Device'] = container['device']
             nheaders['Expect'] = '100-continue'
             pile.spawn(self._connect_put_node, node_iter, partition,
                         req.path_info, nheaders)
+        if print_encrypt_off:
+            print 'ENCRYPTION OFF (NO KEY PROVIDED IN PROXY CONF FILE)'
+        elif encrypted_put:
+            print 'ENCRYPTION ON'
+            print '------------------------ORIGINAL HEADERS-------------------------'
+            printdict(req.headers)
+        my_headers = nheaders
         conns = [conn for conn in pile if conn]
         if len(conns) <= len(nodes) / 2:
             self.app.logger.error(
@@ -1073,7 +1179,10 @@ class ObjectController(Controller):
                 'required connections'),
                 {'conns': len(conns), 'nodes': len(nodes) // 2 + 1})
             return HTTPServiceUnavailable(request=req)
-        chunked = req.headers.get('transfer-encoding')
+        #chunked = req.headers.get('transfer-encoding')
+        chunked = nheaders.get('Transfer-Encoding')
+        original_content_length = 0
+        original_etag = md5()
         try:
             with ContextPool(len(nodes)) as pool:
                 for conn in conns:
@@ -1085,6 +1194,14 @@ class ObjectController(Controller):
                     with ChunkReadTimeout(self.app.client_timeout):
                         try:
                             chunk = next(data_source)
+                            '''(tony) its still importent to track the original
+                            content length since we lose it when tricking the
+                            server that we dont know the content length.'''
+                            original_content_length += len(chunk)
+                            original_etag.update(chunk)
+                            '''(tony)send data through encryption'''
+                            if self.app.encrypt:
+                                chunk = encrypt(chunk, self.app.key)
                         except StopIteration:
                             if chunked:
                                 [conn.queue.put('0\r\n\r\n') for conn in conns]
@@ -1164,6 +1281,21 @@ class ObjectController(Controller):
                     resp.headers[k] = v
             # reset the bytes, since the user didn't actually send anything
             req.bytes_transferred = 0
+        headers = []
+        '''(tony) save the original content length and original etag'''
+        for container in containers:
+            nheaders = my_headers
+            if self.app.encrypt and 'Content-Length' not in nheaders:
+                nheaders['x-object-meta-OCL'] = str(original_content_length)
+                nheaders['x-object-meta-OET'] = original_etag.hexdigest()
+            headers.append(nheaders)
+        if encrypted_put:
+            print '---------------------MODIFIED HEADERS---------------------------'
+            printdict(nheaders)
+            print '----------------------------------------------------------------'
+        if self.app.encrypt:
+            self.make_requests(req, self.app.object_ring,
+                               partition, 'POST', req.path_info, headers)
         resp.last_modified = float(req.headers['X-Timestamp'])
         return resp
 
@@ -1515,8 +1647,14 @@ class BaseApplication(object):
                                             log_route='proxy-access')
         else:
             self.logger = self.access_logger = logger
-
+        '''(tony) add get key stuff here'''
         swift_dir = conf.get('swift_dir', '/etc/swift')
+        self.key = conf.get('key', 'encryption_off')
+        self.encrypt = self.key != 'encryption_off'
+        #AES encryption calls for a 16bit key. md5 hashsum ensures
+        #that the key is 16 bits.
+        if self.encrypt:
+            self.key = md5(self.key).hexdigest()
         self.node_timeout = int(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.client_timeout = int(conf.get('client_timeout', 60))
@@ -1634,7 +1772,6 @@ class BaseApplication(object):
             controller = controller(self, **path_parts)
             controller.trans_id = req.headers.get('x-trans-id', '-')
             self.logger.txn_id = req.headers.get('x-trans-id', None)
-            self.logger.client_ip = get_remote_client(req)
             try:
                 handler = getattr(controller, req.method)
                 if not getattr(handler, 'publicly_accessible'):
