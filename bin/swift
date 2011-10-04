@@ -13,7 +13,8 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import sys
+import time
 from errno import EEXIST, ENOENT
 from hashlib import md5
 from optparse import OptionParser
@@ -536,7 +537,6 @@ def get_object(url, token, container, name, http_conn=None,
                 http_host=conn.host, http_port=conn.port, http_path=path,
                 http_status=resp.status, http_reason=resp.reason)
     if resp_chunk_size:
-
         def _object_body():
             buf = resp.read(resp_chunk_size)
             while buf:
@@ -673,6 +673,115 @@ def put_object(url, token=None, container=None, name=None, contents=None,
                 http_status=resp.status, http_reason=resp.reason)
     return resp.getheader('etag', '').strip('"')
 
+DEBUG = False
+
+'''
+add etag when done
+add into Connection Class as a retriable func
+'''
+def stream_input(url, token, container, segment_size, filename,
+                 chunk_size = 65536, http_conn=None, proxy=None):
+    
+            
+    if(DEBUG):
+        chunk_size = 100
+        segment_size = 300
+        test_file = file('test.txt', 'r')
+        read_func = test_file.read 
+        container = 'final131'
+        filename  = 'test_final'
+    else:
+        read_func = sys.stdin.read                
+    if http_conn:
+        parsed, conn = http_conn
+    else:
+        parsed, conn = http_connection(url, proxy=proxy)
+    if(segment_size < chunk_size):
+        chunk_size = segment_size
+    
+    '''helper function'''  
+    def put_headers(headers):
+        for key, value in headers.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        
+    '''path stuff'''  
+    time_stamp = str(time.time())
+    path = parsed.path
+    '''container path where final file will go'''
+    container_path = '%s/%s' % (path.rstrip('/'), quote(container))
+    file_path = container_path + '/' + filename
+    '''where the file segments will be stored'''
+    segment_container_name = container + '_segments'
+    segment_path = path + '/' + segment_container_name
+    segment_file_path = segment_path + '/' + filename + '/' + time_stamp
+    segment_manifest = segment_container_name + '/' + filename + '/' + time_stamp
+    
+    '''create containers'''
+    headers = {} 
+    headers['X-Auth-Token'] = token
+    headers['Content-length'] = '0'
+    '''create container path'''
+    conn.request('PUT', container_path, '', headers)
+    conn.getresponse().read()
+    conn.request('PUT', segment_path, '', headers)
+    resp = conn.getresponse()
+    resp.read()
+    
+    '''prep loop'''
+    segment = 0
+    total_sent = 0
+    left = segment_size
+    headers = {} 
+    headers['X-Auth-Token'] = token
+    headers['content-type'] = 'application/octet-stream'
+    headers['Transfer-Encoding'] = 'chunked'
+    headers['x-object-meta-mtime'] = time_stamp
+ #   conn.putrequest('PUT', seg_path + '/' + str(segment))
+    conn.putrequest('PUT', segment_file_path + '/' + str(segment))
+    put_headers(headers)
+    chunk = read_func(chunk_size)
+    refresh_rate = 1
+    last_print = 0
+    print "\n"
+    while chunk:
+        left -= len(chunk)
+        if(left <= 0):
+            segment += 1
+            '''new segment file'''
+            conn.send('0\r\n\r\n')
+            conn.getresponse().read()
+            conn.putrequest('PUT', segment_file_path + '/' + str(segment))
+            put_headers(headers)
+            left = segment_size
+        conn.send('%x\r\n%s\r\n' % (len(chunk), chunk))
+        total_sent += len(chunk)
+        #print upload rate
+        if(time.time() - last_print > refresh_rate):
+            sys.stdout.flush()
+            last_print = time.time()
+            rate = float(total_sent) / (float(time.time())- float(time_stamp)) / 1000.0
+            rate_string = 'uploading at rate %d KB/s total sent: %d KB\r' %(int(rate), total_sent // 1000)
+            sys.stdout.write(rate_string)
+            sys.stdout.flush()
+        chunk = read_func(chunk_size)
+    conn.send('0\r\n\r\n')
+    conn.getresponse().read()
+    stdout.flush()
+    ''' left off here need to make manifest file wtf'''
+    headers = {}
+    headers['X-Auth-Token'] = token
+    headers['x-object-meta-mtime'] = time_stamp
+    headers['x-object-manifest'] = segment_manifest
+    headers['Content-Length'] = '0'
+    
+    conn.request('PUT', file_path, '', headers)
+    resp = conn.getresponse()
+    resp.read()
+    print "\n"
+    print filename
+    conn.close()
+
 
 def post_object(url, token, container, name, headers, http_conn=None):
     """
@@ -718,8 +827,8 @@ def delete_object(url, token=None, container=None, name=None, http_conn=None,
     :param headers: additional headers to include in the request
     :param proxy: proxy to connect through, if any; None by default; str of the
                   format 'http://127.0.0.1:8888' to set one
-    :raises ClientException: HTTP DELETE request failed
-    """
+    :raises ClientException: HTTP DELETE request failed 
+    """ 
     if http_conn:
         parsed, conn = http_conn
     else:
@@ -795,7 +904,7 @@ class Connection(object):
                 if self.attempts > self.retries:
                     raise
                 self.http_conn = None
-            except ClientException, err:
+            except ClientException as err:
                 if self.attempts > self.retries:
                     raise
                 if err.http_status == 401:
@@ -864,7 +973,11 @@ class Connection(object):
         """Wrapper for :func:`get_object`"""
         return self._retry(None, get_object, container, obj,
                            resp_chunk_size=resp_chunk_size)
-
+    
+    def stream_input(self, container, segment_size, filename,
+                     chunk_size = 65536):
+        stream_input(self.url, self.token, container, segment_size, filename, chunk_size)
+            
     def put_object(self, container, obj, contents, content_length=None,
                    etag=None, chunk_size=65536, content_type=None,
                    headers=None):
@@ -929,7 +1042,8 @@ class QueueFunctionThread(Thread):
 
     def __init__(self, queue, func, *args, **kwargs):
         """ Calls func for each item in queue; func is called with a queued
-            item as the first arg followed by *args and **kwargs. Use the abort
+            item
+            the first arg followed by *args and **kwargs. Use the abort
             attribute to have the thread empty the queue (without processing)
             and exit. """
         Thread.__init__(self)
@@ -1151,7 +1265,6 @@ def st_download(options, args, print_queue, error_queue):
         return
 
     object_queue = Queue(10000)
-
     def _download_object(queue_arg, conn):
         if len(queue_arg) == 2:
             container, obj = queue_arg
@@ -1561,26 +1674,42 @@ upload [options] container file_or_directory [file_or_directory] [...]
     and --leave-segments are options as well (see --help for more).
 '''.strip('\n')
 
+DEFAULT_SEGMENT_SIZE = 2147483648
+DEFAULT_CHUNK_SIZE = 65536
 
 def st_upload(options, args, print_queue, error_queue):
     parser.add_option('-c', '--changed', action='store_true', dest='changed',
         default=False, help='Will only upload files that have changed since '
         'the last upload')
-    parser.add_option('-S', '--segment-size', dest='segment_size', help='Will '
-        'upload files in segments no larger than <size> and then create a '
-        '"manifest" file that will download all the segments as if it were '
-        'the original file. The segments will be uploaded to a '
-        '<container>_segments container so as to not pollute the main '
-        '<container> listings.')
+    parser.add_option('-S', '--segment-size', type = 'int', 
+                      default = DEFAULT_SEGMENT_SIZE, dest='segment_size', help='Will '
+                        'upload files in segments no larger than <size> and then create a '
+                        '"manifest" file that will download all the segments as if it were '
+                        'the original file. The segments will be uploaded to a '
+                        '<container>_segments container so as to not pollute the main '
+                        '<container> listings.')
     parser.add_option('', '--leave-segments', action='store_true',
         dest='leave_segments', default=False, help='Indicates that you want '
         'the older segments of manifest objects left alone (in the case of '
         'overwrites)')
+    parser.add_option('-P', '--pipe', dest = 'pipe',
+                      default = False, help = 'Pipe standard in')
     (options, args) = parse_args(parser, args)
     args = args[1:]
-    if len(args) < 2:
+    if len(args) < 2 and not (len(args) == 1 and options.pipe):
         error_queue.put('Usage: %s [options] %s' %
                         (basename(argv[0]), st_upload_help))
+        return
+    url, token = get_auth(options.auth, options.user, options.key,
+        snet=options.snet)
+    create_connection = lambda: Connection(options.auth, options.user,
+        options.key, preauthurl=url, preauthtoken=token, snet=options.snet)
+    conn = create_connection()
+
+    if options.pipe:
+        container = args[0]
+        conn.stream_input(container, segment_size = options.segment_size, 
+                          filename = options.pipe, chunk_size = DEFAULT_CHUNK_SIZE)
         return
     object_queue = Queue(10000)
 
@@ -1607,8 +1736,6 @@ def st_upload(options, args, print_queue, error_queue):
             obj = path
             if obj.startswith('./') or obj.startswith('.\\'):
                 obj = obj[2:]
-            if obj.startswith('/'):
-                obj = obj[1:]
             put_headers = {'x-object-meta-mtime': str(getmtime(path))}
             if dir_marker:
                 if options.changed:
@@ -1647,8 +1774,9 @@ def st_upload(options, args, print_queue, error_queue):
                     except ClientException, err:
                         if err.http_status != 404:
                             raise
+                size = getsize(path)
                 if options.segment_size and \
-                        getsize(path) < options.segment_size:
+                        getsize(path) > options.segment_size:
                     full_size = getsize(path)
                     segment_queue = Queue(10000)
                     segment_threads = [QueueFunctionThread(segment_queue,
@@ -1722,7 +1850,7 @@ def st_upload(options, args, print_queue, error_queue):
             if err.errno != ENOENT:
                 raise
             error_queue.put('Local file %s not found' % repr(path))
-
+    
     def _upload_dir(path):
         names = listdir(path)
         if not names:
@@ -1734,16 +1862,7 @@ def st_upload(options, args, print_queue, error_queue):
                     _upload_dir(subpath)
                 else:
                     object_queue.put({'path': subpath})
-
-    url, token = get_auth(options.auth, options.user, options.key,
-        snet=options.snet)
-    create_connection = lambda: Connection(options.auth, options.user,
-        options.key, preauthurl=url, preauthtoken=token, snet=options.snet)
-    object_threads = [QueueFunctionThread(object_queue, _object_job,
-        create_connection()) for _junk in xrange(10)]
-    for thread in object_threads:
-        thread.start()
-    conn = create_connection()
+        
     # Try to create the container, just in case it doesn't exist. If this
     # fails, it might just be because the user doesn't have container PUT
     # permissions, so we'll ignore any error. If there's really a problem,
@@ -1754,6 +1873,11 @@ def st_upload(options, args, print_queue, error_queue):
             conn.put_container(args[0] + '_segments')
     except Exception:
         pass
+    object_threads = [QueueFunctionThread(object_queue, _object_job,
+        create_connection()) for _junk in xrange(10)]
+    for thread in object_threads:
+        thread.start()
+    
     try:
         for arg in args[1:]:
             if isdir(arg):
