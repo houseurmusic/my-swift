@@ -76,7 +76,7 @@ def encrypt(plain, key):
 
 '''(tony)AES decryption function that takes in cipher text assuming spaced padding
 at the end.'''
-def decrypt(cipher, key):
+def decrypt(cipher, key, remaining_length):
     plain = cipher
     mode = AES.MODE_CBC
     ENCRYPTION_BLOCK_SIZE = 16
@@ -84,7 +84,9 @@ def decrypt(cipher, key):
         decryptor = AES.new(key, mode)
         plain = decryptor.decrypt(cipher)
         '''remove padding'''
-        plain = plain.rstrip(' ')
+        if remaining_length < ENCRYPTION_BLOCK_SIZE:
+            max = ENCRYPTION_BLOCK_SIZE - remaining_length
+            plain = plain[0:max]
     return plain
 
 
@@ -918,13 +920,7 @@ class ObjectController(Controller):
         '''(tony) return the response header here if encrytion is off'''
         if not self.app.encrypt:
             return resp
-        iter = resp.app_iter
-        def decrypt_iter():
-            for chunk in iter:
-                chunk = decrypt(chunk, self.app.key)
-                yield chunk
-        '''change the resp's iter to the decrypt iter defined above'''
-        resp.app_iter = decrypt_iter()
+
 
         '''(tony)Update content-length to = the original-content-length and update
         the etag to = the original etag. We do this since both these change
@@ -935,7 +931,7 @@ class ObjectController(Controller):
         for key, value in headers:
             if key == 'x-object-meta-ocl':
                 encrypted_resp = True
-                nheaders['Content-Length'] = value
+                nheaders['Content-Length'] = ocl = value
             elif key == 'x-object-meta-oet':
                 nheaders['etag'] = value
             elif key != 'Content-Length' and key != 'etag':
@@ -948,6 +944,17 @@ class ObjectController(Controller):
             printdict(nheaders)
             print '---------------------------------------------------------------'
         resp.headers = nheaders
+        iter = resp.app_iter
+        def decrypt_iter():
+            data_sent_length = 0;
+            for chunk in iter:
+                remaining_length = ocl - data_sent_length
+                chunk = decrypt(chunk, self.app.key, remaining_length)
+                yield chunk
+                data_sent_length += len(chunk)
+
+        '''change the resp's iter to the decrypt iter defined above'''
+        resp.app_iter = decrypt_iter()
         return resp
 
     @public
