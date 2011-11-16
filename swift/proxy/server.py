@@ -18,9 +18,11 @@ try:
     import simplejson as json
 except ImportError:
     import json
+from My_gpg import My_gpg
 from Crypto.Cipher import AES
 import mimetypes
 import os
+import sys
 import re
 import time
 import traceback
@@ -31,8 +33,12 @@ import uuid
 import functools
 from hashlib import md5
 from random import shuffle
+from subprocess import Popen
+from subprocess import PIPE
+from threading import Thread
 
 from eventlet import sleep, GreenPile, Queue, TimeoutError
+from eventlet.queue import Empty
 from eventlet.timeout import Timeout
 from webob.exc import HTTPAccepted, HTTPBadRequest, HTTPMethodNotAllowed, \
     HTTPNotFound, HTTPPreconditionFailed, \
@@ -52,43 +58,11 @@ from swift.common.exceptions import ChunkReadTimeout, \
     ChunkWriteTimeout, ConnectionTimeout
 
 
-'''For encryption to be on the user must specify a key in the configuration file
-[app:proxy-server]
-use = egg:swift#proxy
-allow_account_management = true
-key = <your key>
-'''
 
 
-
-'''(tony)Encrypt function that performs AES encryption. AES encryption needs a block
-size divisible by 16 so spaces are used to pad incoming bytes. '''
-def encrypt(plain, key):
-    mode = AES.MODE_CBC
-    encryptor = AES.new(key, mode)
-    ENCRYPTION_BLOCK_SIZE = 16
-    mod = len(plain) % ENCRYPTION_BLOCK_SIZE
-    if(mod != 0):
-        '''pad with spaces to make it divisible by the block_size'''
-        plain = plain + ' ' * (ENCRYPTION_BLOCK_SIZE - mod)
-    cipher = encryptor.encrypt(plain)
-    return cipher
-
-'''(tony)AES decryption function that takes in cipher text assuming spaced padding
-at the end.'''
-def decrypt(cipher, key, remaining_length):
-    plain = cipher
-    mode = AES.MODE_CBC
-    ENCRYPTION_BLOCK_SIZE = 16
-    if len(cipher) and not (len(cipher) % ENCRYPTION_BLOCK_SIZE):
-        decryptor = AES.new(key, mode)
-        plain = decryptor.decrypt(cipher)
-        '''remove padding'''
-        if remaining_length < ENCRYPTION_BLOCK_SIZE:
-            max = ENCRYPTION_BLOCK_SIZE - remaining_length
-            plain = plain[0:max]
-    return plain
-
+'''(tony) specify how long we wait before gpg's buffer is closed after the
+last chunk as been digested'''
+TIME_OUT = .5
 
 def update_headers(response, headers):
     """
@@ -945,14 +919,20 @@ class ObjectController(Controller):
             print '---------------------------------------------------------------'
         resp.headers = nheaders
         iter = resp.app_iter
+        etag = md5()
         def decrypt_iter():
-            data_sent_length = 0;
+            gpg = My_gpg('d', passphrase = 'test-swift')
+            chunk_buffer = ""
             for chunk in iter:
-                remaining_length = ocl - data_sent_length
-                chunk = decrypt(chunk, self.app.key, remaining_length)
-                yield chunk
-                data_sent_length += len(chunk)
-
+                gpg.digest(chunk)
+                '''(tony) use buffer since we dont know how large gpg.dump_buffer
+                will be'''
+                chunk_buffer += gpg.dump_buffer()
+                if(len(chunk_buffer) > self.app.client_chunk_size):
+                    yield chunk_buffer
+                    chunk_buffer = ""
+            chunk_buffer += gpg.close_and_dump(TIME_OUT)
+            yield chunk_buffer
         '''change the resp's iter to the decrypt iter defined above'''
         resp.app_iter = decrypt_iter()
         return resp
@@ -1162,6 +1142,7 @@ class ObjectController(Controller):
                     server into calculating its own content-length. This way
                     the encrypted length is calculated on the server'''
                     encrypted_put = True
+                    self.app.clent_content_length = nheaders['Content-Length']
                     del nheaders['Content-Length']
                     nheaders['Transfer-Encoding'] = 'chunked'
             elif 'Content-Length' in nheaders:
@@ -1190,6 +1171,9 @@ class ObjectController(Controller):
         chunked = nheaders.get('Transfer-Encoding')
         original_content_length = 0
         original_etag = md5()
+
+        gpg = My_gpg('e', user = 'test-swift')
+        cipher_buffer = ""
         try:
             with ContextPool(len(nodes)) as pool:
                 for conn in conns:
@@ -1201,27 +1185,46 @@ class ObjectController(Controller):
                     with ChunkReadTimeout(self.app.client_timeout):
                         try:
                             chunk = next(data_source)
-                            '''(tony) its still importent to track the original
-                            content length since we lose it when tricking the
-                            server that we dont know the content length.'''
-                            original_content_length += len(chunk)
-                            original_etag.update(chunk)
-                            '''(tony)send data through encryption'''
                             if self.app.encrypt:
-                                chunk = encrypt(chunk, self.app.key)
+                                '''(tony)send data through encryption'''
+                                gpg.digest(chunk)
+                                '''(tony) its still importent to track the original
+                                content length since we lose it when tricking the
+                                server that we dont know the content length.'''
+                                original_content_length += len(chunk)
+                                original_etag.update(chunk)
+                                '''(tony) buffer is used to minimize the amount of sends to the
+                                server'''
+                                cipher_buffer += gpg.dump_buffer(0)
                         except StopIteration:
+                            print 'here'
+                            cipher_buffer += gpg.close_and_dump(TIME_OUT)
+                            '''(tony) When gpg's stdin is closed, it will dump whatever
+                            output it has left. We need to do one additional send to
+                            the server once we know we have reached the end of the file.'''
+                            for conn in list(conns):
+                                if not conn.failed:
+                                    conn.queue.put('%x\r\n%s\r\n' % (len(cipher_buffer), cipher_buffer)
+                                                    if chunked else cipher)
+                                else:
+                                    conns.remove(conn)
                             if chunked:
                                 [conn.queue.put('0\r\n\r\n') for conn in conns]
                             break
                     req.bytes_transferred += len(chunk)
                     if req.bytes_transferred > MAX_FILE_SIZE:
                         return HTTPRequestEntityTooLarge(request=req)
-                    for conn in list(conns):
-                        if not conn.failed:
-                            conn.queue.put('%x\r\n%s\r\n' % (len(chunk), chunk)
-                                            if chunked else chunk)
-                        else:
-                            conns.remove(conn)
+                    '''(tony) only send to the sever if the buffer is greather than
+                    the specified chunk size.'''
+                    if(len(cipher_buffer) > self.app.client_chunk_size):
+                        for conn in list(conns):
+                            if not conn.failed:
+                                conn.queue.put('%x\r\n%s\r\n' % (len(cipher_buffer), cipher_buffer)
+                                                if chunked else cipher_buffer)
+                            else:
+                                conns.remove(conn)
+                        '''(tony) flush buffer'''
+                        cipher_buffer = ""
                     if len(conns) <= len(nodes) / 2:
                         self.app.logger.error(_('Object PUT exceptions during'
                             ' send, %(conns)s/%(nodes)s required connections'),
@@ -1656,8 +1659,10 @@ class BaseApplication(object):
             self.logger = self.access_logger = logger
         '''(tony) add get key stuff here'''
         swift_dir = conf.get('swift_dir', '/etc/swift')
+        self.client_content_length = None
         self.key = conf.get('key', 'encryption_off')
         self.encrypt = self.key != 'encryption_off'
+        self.user = conf.get('user', 'test-swift')
         #AES encryption calls for a 16bit key. md5 hashsum ensures
         #that the key is 16 bits.
         if self.encrypt:
