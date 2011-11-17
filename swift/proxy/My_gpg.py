@@ -16,14 +16,13 @@ except ImportError:
     from queue import Queue, Empty
 
 class My_gpg():
-    ON_POSIX = 'posix' in sys.builtin_module_names
+    ON_POSIX = 'posix' in sys.builtin_module_names 
 
     def __init__(self, encrypt_or_decrypt, user = None, passphrase = None):
         if(encrypt_or_decrypt[0] == 'e'):
             cmd = 'gpg -r ' + user + ' -e'
         else:
             cmd = 'gpg -d --batch --passphrase-fd 0'
-        print cmd
         self.p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, bufsize = 1024)
 
         self.stdin = self.p.stdin
@@ -68,10 +67,10 @@ class My_gpg():
     def close_and_dump(self, timeout = .1):
         self.stdin.close()
         data = self.dump_buffer(timeout)
-        self.stdout.close()
+        #self.stdout.close()
         return data
 
     def close(self):
         self.stdin.close()
-        self.stdout.close()
+        #self.stdout.close()
 	
