@@ -701,6 +701,8 @@ class Controller(object):
             if req.method == 'GET' and source.status in (200, 206):
                 res = Response(request=req, conditional_response=True)
                 res.bytes_transferred = 0
+                '''(tony) this might be the right iter
+                confirmed, all decryption here'''
                 def file_iter():
                     try:
                         while True:
@@ -709,6 +711,8 @@ class Controller(object):
                             if not chunk:
                                 break
                             yield chunk
+                            print 'in get our head base chunk size = ' + str(len(chunk))
+
                             res.bytes_transferred += len(chunk)
                     except GeneratorExit:
                         res.client_disconnect = True
@@ -724,7 +728,7 @@ class Controller(object):
                     source.getheader('x-timestamp')
                 update_headers(res, {'accept-ranges': 'bytes'})
                 res.status = source.status
-                res.content_length = source.getheader('Content-Length')
+                #res.content_length = source.getheader('Content-Length')
                 if source.getheader('Content-Type'):
                     res.charset = None
                     res.content_type = source.getheader('Content-Type')
@@ -1267,6 +1271,8 @@ class ObjectController(Controller):
                 _('ERROR Exception causing client disconnect'))
             return Response(status='499 Client Disconnect')
         if req.content_length and req.bytes_transferred < req.content_length:
+            '''tony'''
+            print 'bytes_transferred < content length'
             req.client_disconnect = True
             self.app.logger.warn(
                 _('Client disconnected without sending enough data'))
