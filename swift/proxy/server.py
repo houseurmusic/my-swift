@@ -702,7 +702,7 @@ class Controller(object):
                 res = Response(request=req, conditional_response=True)
                 res.bytes_transferred = 0
                 '''(tony) this might be the right iter
-                confirmed, all decryption here'''
+                confirmed, move '''
                 def file_iter():
                     try:
                         while True:
@@ -890,6 +890,9 @@ class ObjectController(Controller):
                 # them with a set content-length and computed etag.
                 if listing:
                     content_length = sum(o['bytes'] for o in listing)
+                    for o in listing:
+                        print str(o)
+                    print 'content_length = ' + str(content_length)
                     last_modified = max(o['last_modified'] for o in listing)
                     last_modified = datetime(*map(int, re.split('[^\d]',
                         last_modified)[:-1]))
@@ -899,11 +902,18 @@ class ObjectController(Controller):
                     content_length = 0
                     last_modified = resp.last_modified
                     etag = md5().hexdigest()
-                headers = {
-                    'X-Object-Manifest': resp.headers['x-object-manifest'],
-                    'Content-Type': resp.content_type,
-                    'Content-Length': content_length,
-                    'ETag': etag}
+                if(self.app.encrypt):
+                    headers = {
+                        'X-Object-Manifest': resp.headers['x-object-manifest'],
+                        'Content-Type': resp.content_type,
+                        #'Content-Length': content_length,
+                        'ETag': etag}
+                else:
+                    headers = {
+                        'X-Object-Manifest': resp.headers['x-object-manifest'],
+                        'Content-Type': resp.content_type,
+                        'Content-Length': content_length,
+                        'ETag': etag}
                 for key, value in resp.headers.iteritems():
                     if key.lower().startswith('x-object-meta-'):
                         headers[key] = value
@@ -911,7 +921,8 @@ class ObjectController(Controller):
                                 conditional_response=True)
                 resp.app_iter = SegmentedIterable(self, lcontainer, listing,
                                                   resp)
-                resp.content_length = content_length
+                if(not self.app.encrypt):
+                    resp.content_length = content_length
                 resp.last_modified = last_modified
             resp.headers['accept-ranges'] = 'bytes'
             return resp
