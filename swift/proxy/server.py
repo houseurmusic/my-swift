@@ -160,7 +160,6 @@ class SegmentedIterable(object):
         :raises: StopIteration when there are no more object segments.
         """
         try:
-            print 'in load nex segment'
             self.segment += 1
             self.segment_dict = self.segment_peek or self.listing.next()
             self.segment_peek = None
@@ -204,37 +203,34 @@ class SegmentedIterable(object):
 
     def __iter__(self):
         """ Standard iterator function that returns the object's contents. """
-        #gpg = My_gpg()
         try:
-            gpg = My_gpg('d', passphrase = 'test-swift')
-            #plain = ""
             while True:
                 if not self.segment_iter:
                     self._load_next_segment()
                 while True:
                     with ChunkReadTimeout(self.controller.app.node_timeout):
                         try:
-                            '''tony left off here, todo:
-                            try to move decrypt code here, for some reason,
-                            the other decryt iter i made is not seeing all of this
-                            '''
                             chunk = self.segment_iter.next()
-                            gpg.digest(chunk)
-                            plain = gpg.dump_buffer()
-                            print 'chunk length in raw iter: ' + str(len(chunk))
                             break
                         except StopIteration:
-                            plain = gpg.close_and_dump(TIME_OUT)
-                            print 'here in stop iter ' + str(len(plain))
-                            gpg = My_gpg('d', passphrase = 'test-swift')
                             self._load_next_segment()
-                            break
                 self.position += len(chunk)
                 self.response.bytes_transferred = getattr(self.response,
                     'bytes_transferred', 0) + len(chunk)
-                if (len(plain) > 0):
-                    print 'send plain from raw_iter: ' + str(len(plain))
-                    yield plain
+                yield chunk
+        except StopIteration:
+            raise
+        except Exception, err:
+            if not getattr(err, 'swift_logged', False):
+                self.controller.app.logger.exception(_('ERROR: While '
+                    'processing manifest /%(acc)s/%(cont)s/%(obj)s'),
+                    {'acc': self.controller.account_name,
+                     'cont': self.controller.container_name,
+                     'obj': self.controller.object_name})
+                err.swift_logged = True
+                self.response.status_int = 503
+            raise
+        
         except StopIteration:
             print 'here in final stop'
             raise
@@ -704,15 +700,23 @@ class Controller(object):
                 '''(tony) this might be the right iter
                 confirmed, move '''
                 def file_iter():
+                    gpg = My_gpg('d', passphrase = 'test-swift')
                     try:
+                        
                         while True:
+                            print 'here'
                             with ChunkReadTimeout(self.app.node_timeout):
                                 chunk = source.read(self.app.object_chunk_size)
                             if not chunk:
                                 break
-                            yield chunk
-                            print 'in get our head base chunk size = ' + str(len(chunk))
-
+                            
+                            if(server_type == 'Object' and self.app.encrypt):
+                                gpg.digest(chunk)
+                                chunk = gpg.dump_buffer()
+                                if(len(chunk) > 0):
+                                    yield chunk
+                            else:
+                                yield chunk
                             res.bytes_transferred += len(chunk)
                     except GeneratorExit:
                         res.client_disconnect = True
@@ -721,6 +725,17 @@ class Controller(object):
                         self.exception_occurred(node, _('Object'),
                             _('Trying to read during GET of %s') % req.path)
                         raise
+                    if(server_type == 'Object' and self.app.encrypt):
+                        plain = gpg.close_and_dump(10)
+                        index = 0
+                        while True:
+                            chunk = plain[index:index + self.app.object_chunk_size]
+                            print 'in final yielding: ' + str(len(chunk))
+                            if(len(chunk) > 0):
+                                yield chunk
+                                index += len(chunk)
+                            else:
+                                break
                 res.app_iter = file_iter()
                 update_headers(res, source.getheaders())
                 # Used by container sync feature
@@ -892,7 +907,7 @@ class ObjectController(Controller):
                     content_length = sum(o['bytes'] for o in listing)
                     for o in listing:
                         print str(o)
-                    print 'content_length = ' + str(content_length)
+                    print 'segmented total content length = ' + str(content_length)
                     last_modified = max(o['last_modified'] for o in listing)
                     last_modified = datetime(*map(int, re.split('[^\d]',
                         last_modified)[:-1]))
@@ -921,6 +936,7 @@ class ObjectController(Controller):
                                 conditional_response=True)
                 resp.app_iter = SegmentedIterable(self, lcontainer, listing,
                                                   resp)
+
                 if(not self.app.encrypt):
                     resp.content_length = content_length
                 resp.last_modified = last_modified
@@ -955,23 +971,6 @@ class ObjectController(Controller):
         resp.headers = nheaders
         iter = resp.app_iter
         etag = md5()
-        print 'here'
-        def decrypt_iter():
-            gpg = My_gpg('d', passphrase = 'test-swift')
-            chunk_buffer = ""
-            chunk_size = self.app.client_chunk_size
-            for chunk in iter:
-                gpg.digest(chunk)
-                plain = gpg.dump_buffer()
-                if(len(plain) > 0):
-                    print 'sending plain ' + str(len(plain))
-                    yield plain
-            #print 'sending end: ' + str(len(chunk_buffer))
-            plain = gpg.close_and_dump(TIME_OUT)
-            print 'sending plain' + str(len(plain))
-            yield plain
-        '''change the resp's iter to the decrypt iter defined above'''
-        resp.app_iter = decrypt_iter()
         return resp
 
     @public
