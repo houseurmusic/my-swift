@@ -700,7 +700,7 @@ class Controller(object):
                 '''(tony) this might be the right iter
                 confirmed, move '''
                 def file_iter():
-                    gpg = My_gpg('d', passphrase = 'test-swift')
+                    gpg = My_gpg('d', passphrase = self.app.key)
                     try:
                         
                         while True:
@@ -1207,8 +1207,9 @@ class ObjectController(Controller):
         chunked = nheaders.get('Transfer-Encoding')
         original_content_length = 0
         original_etag = md5()
-
-        gpg = My_gpg('e', user = 'test-swift')
+        print 'user = ' + self.app.user
+        print 'pass = ' + self.app.key
+        gpg = My_gpg('e', user = self.app.user)
         cipher_buffer = ""
         try:
             with ContextPool(len(nodes)) as pool:
@@ -1701,11 +1702,7 @@ class BaseApplication(object):
         self.client_content_length = None
         self.key = conf.get('key', 'encryption_off')
         self.encrypt = self.key != 'encryption_off'
-        self.user = conf.get('user', 'test-swift')
-        #AES encryption calls for a 16bit key. md5 hashsum ensures
-        #that the key is 16 bits.
-        if self.encrypt:
-            self.key = md5(self.key).hexdigest()
+        self.user = conf.get('gpg_user', 'test-swift')
         self.node_timeout = int(conf.get('node_timeout', 10))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
         self.client_timeout = int(conf.get('client_timeout', 60))
