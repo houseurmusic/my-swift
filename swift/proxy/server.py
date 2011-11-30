@@ -198,7 +198,6 @@ class SegmentedIterable(object):
             raise
 
     def next(self):
-        print 'here in next'
         return iter(self).next()
 
     def __iter__(self):
@@ -232,7 +231,6 @@ class SegmentedIterable(object):
             raise
         
         except StopIteration:
-            print 'here in final stop'
             raise
         except Exception, err:
             if not getattr(err, 'swift_logged', False):
@@ -697,21 +695,31 @@ class Controller(object):
             if req.method == 'GET' and source.status in (200, 206):
                 res = Response(request=req, conditional_response=True)
                 res.bytes_transferred = 0
-                '''(tony) this might be the right iter
-                confirmed, move '''
                 def file_iter():
+                    '''(tony) This is the final iterator which a file must pass
+                    through. This iterates through a segmented file as a single
+                    file.
+                    Since this is the final iterator it a good idea to intercept
+                    the packets here and decrypt them.'''
                     gpg = My_gpg('d', passphrase = self.app.key)
                     try:
-                        
                         while True:
                             print 'here'
                             with ChunkReadTimeout(self.app.node_timeout):
                                 chunk = source.read(self.app.object_chunk_size)
                             if not chunk:
                                 break
-                            
+                            '''server_type == 'object' confirms that the chunk being
+                            sent is actually the file and not file information headers
+                            such as a manifest file'''
                             if(server_type == 'Object' and self.app.encrypt):
                                 gpg.digest(chunk)
+                                '''gpg.dump_buffer() checks if there has been ouptut
+                                from the gpg process to standard out. In a few of my test
+                                cases, at this point gpg usually doesnt have an output
+                                until the stream is closed. Maybe for very large files
+                                this may come in use since gpg may need to output because of
+                                memory constraints'''
                                 chunk = gpg.dump_buffer()
                                 if(len(chunk) > 0):
                                     yield chunk
@@ -725,12 +733,17 @@ class Controller(object):
                         self.exception_occurred(node, _('Object'),
                             _('Trying to read during GET of %s') % req.path)
                         raise
+                    '''(tony) at this point we are done with reading from the server'''
                     if(server_type == 'Object' and self.app.encrypt):
+                        '''gpg.close_and_dump will always return a string. This string can
+                        be very large since gpg lets it accumulate in memory before outputing
+                        it. Therefore the variable plain maybe very large.'''
                         plain = gpg.close_and_dump(10)
                         index = 0
                         while True:
+                            '''Since plain is usually much larger then the chunk_size
+                            we need to break up into chunks to send back to the client'''
                             chunk = plain[index:index + self.app.object_chunk_size]
-                            print 'in final yielding: ' + str(len(chunk))
                             if(len(chunk) > 0):
                                 yield chunk
                                 index += len(chunk)
@@ -917,6 +930,12 @@ class ObjectController(Controller):
                     content_length = 0
                     last_modified = resp.last_modified
                     etag = md5().hexdigest()
+                '''(tony) in order to get around file size checks we omit content
+                length in the headers so the client won't be expecting a specific file
+                size. This is because the encrypted file's size differs from the encrypted
+                file's size. I believe this can be fixed later, since we store the original
+                content length in the headers. The content_length variable here is from 
+                line 919'''
                 if(self.app.encrypt):
                     headers = {
                         'X-Object-Manifest': resp.headers['x-object-manifest'],
@@ -942,36 +961,36 @@ class ObjectController(Controller):
                 resp.last_modified = last_modified
             resp.headers['accept-ranges'] = 'bytes'
             return resp
-        '''(tony) return the response header here if encrytion is off'''
-        if not self.app.encrypt:
-            return resp
-
-
-        '''(tony)Update content-length to = the original-content-length and update
-        the etag to = the original etag. We do this since both these change
-        when decryption is used.'''
-        nheaders = dict()
-        encrypted_resp = False
-        headers = resp.headers.iteritems()
-        for key, value in headers:
-            if key == 'x-object-meta-ocl':
-                encrypted_resp = True
-                nheaders['Content-Length'] = ocl = value
-            elif key == 'x-object-meta-oet':
-                nheaders['etag'] = value
-            elif key != 'Content-Length' and key != 'etag':
-                nheaders[key] = value
-        if encrypted_resp:
-            print '*****************************************************************'
-            print '--Updating response headers for decryption length changes from:--'
-            printdict(resp.headers)
-            print '---------------------New Response Headers----------------------'
-            printdict(nheaders)
-            print '---------------------------------------------------------------'
-        resp.headers = nheaders
-        iter = resp.app_iter
-        etag = md5()
-        return resp
+        '''outdated code, maybe useful if we decide to restore content-length functionality'''
+#        if not self.app.encrypt:        '''(tony) return the response header here if encrytion is off'''
+#            return resp
+#
+#
+#        '''(tony)Update content-length to = the original-content-length and update
+#        the etag to = the original etag. We do this since both these change
+#        when decryption is used.'''
+#        nheaders = dict()
+#        encrypted_resp = False
+#        headers = resp.headers.iteritems()
+#        for key, value in headers:
+#            if key == 'x-object-meta-ocl':
+#                encrypted_resp = True
+#                nheaders['Content-Length'] = ocl = value
+#            elif key == 'x-object-meta-oet':
+#                nheaders['etag'] = value
+#            elif key != 'Content-Length' and key != 'etag':
+#                nheaders[key] = value
+#        if encrypted_resp:
+#            print '*****************************************************************'
+#            print '--Updating response headers for decryption length changes from:--'
+#            printdict(resp.headers)
+#            print '---------------------New Response Headers----------------------'
+#            printdict(nheaders)
+#            print '---------------------------------------------------------------'
+#        resp.headers = nheaders
+#        iter = resp.app_iter
+#        etag = md5()
+#        return resp
 
     @public
     @delay_denial
