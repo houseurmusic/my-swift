@@ -42,8 +42,10 @@ class GPGEncryption():
             #cmd = ['/usr/bin/gpg', '--no-tty', '--homedir', '/etc/swift/gnupg', '-r', user, '-e']
             #cmd = ['tr', 'a', 'A']
             #-a for ascii armor
-            cmd = 'gpg -a -r ' + user + ' -e'
-            #cmd = 'cat'
+            #cmd = 'gpg -a -r ' + user + ' -e'
+            cmd = 'cat'
+            #cmd = '/home/amedeiro/bin/MyCat.py'
+            #cmd = '/home/amedeiro/bin/python MyCat.py'
             self.term_char = chr(0)
             self.stream_iter = iterable
             self.stream_iter_read = iterable.read
@@ -55,8 +57,9 @@ class GPGEncryption():
             #cmd = ['gpg', '-d', '--batch', '--passphrase-fd', '0']
             #cmd = ['gpg', '--no-tty', '--homedir', '/etc/swift/gnupg', '-d', '--batch', '--passphrase-fd', '0']
             #cmd = ['tr', 'd', 'D']
-            cmd = 'gpg -d --batch --passphrase-fd 0'
-            #cmd = 'cat'
+            #cmd = 'gpg -d --batch --passphrase-fd 0'
+            cmd = 'cat'
+            #cmd = '/home/amedeiro/bin/python MyCat.py'
         #self.str_iter = stringIterate(self.buffer, read_size)
         self.p = Process(cmd, shell=True, bufsize = 2)
         # TODO send stderr output to the logs
@@ -64,7 +67,6 @@ class GPGEncryption():
         #self.p = Popen(cmd, stdin=PIPE, stdout=PIPE, bufsize = 4096)
         if(encrypt_or_decrypt[0] == 'd'):
             self.p.write('test-swift' + '\n')
-
 
         self.my_buffer = ''
 
@@ -79,49 +81,30 @@ class GPGEncryption():
             index += chunk_size
 
 
-    #simple version of read, only expects to read a file less than chunk_size
-    def read(self, read_size):
+     def readFromStream():
+            chunk = self.stream_iter_read(read_size)
+            while chunk:
+                self.p.stdin.write(chunk)
+                chunk = self.stream_iter_read(read_size)
+            self.p.stdin.close()
+            
+     def read(self, read_size):
         def padder(text, div, pad = chr(0)):
             print 'padder reading ' + text
             size = (div - len(text) % div) + len(text)
             diff = size - len(text)
             text += pad * diff
             return text
-        #sometimes this gets called when there is nothing to process
-        #in that case we don't bother opening a pipe
-        next_chunk = self.stream_iter_read(read_size)
-        if self.first_read and next_chunk == '':
-            return ''
-        self.first_read = False
-        read_size = 15
-        while(len(self.buffer) < read_size and not self.padded):
-            chunk = next_chunk
-            #we can use next_chunk to see if the next chunk is blank
-            #if the next_chunk is blank we don't want to digest the current
-            #chunk right away. This way when we close and dump the buffer, 
-            #we are ensured to have some output. 
-            next_chunk = self.stream_iter_read(read_size)
-            print 'reading: ' + chunk + ' pid: ' + str(self.p.pid())
-            if(next_chunk != ''):
-                self.digest(chunk)
-                self.buffer += self.dump_buffer()
-            else:
-                self.digest(chunk)
-                if not self.padded:
-                    print 'here'
-                    self.buffer += self.close_and_dump()
-                    #pad encrypted_chunk
-                    self.buffer = padder(self.buffer, read_size, self.term_char)
-                    self.padded = True
-                break
 
-        encrypted_chunk = self.buffer[0 : read_size]
-        self.buffer = self.buffer[read_size : len(self.buffer)]
-        
-        print 'read returning ' + encrypted_chunk
-        return encrypted_chunk
+        if self.first_read:
+            self.first_read = False
+            t = Thread(target = readFromStream)
+            t.start()
+
+        return self.p.stdout.read(read_size)
 
     def digest(self, chunk):
+        print "digesting chunk = " + chunk
         self.p.write(chunk)
 
     def dump_buffer(self):
@@ -139,16 +122,20 @@ class GPGEncryption():
         #we can wait for the process to dump its last output... Might be a problem
         #if output dumps
         #poll = self.p.wait(os.WNOHANG)
-        while buf == '':
+        print 'entering close and dump loop'
+        count = 0
+        while buf == '' and count < 100:
             buf = self.dump_buffer()
             time.sleep(.01)
             print self.p.readerr()
             poll = self.p.wait(os.WNOHANG)
+            count = count + 1
+        print 'leaving close and dump loop'
         poll = self.p.wait(os.WNOHANG)
         print poll
         return buf
 
-    
+
 class DecryptionIterable:
     def __init__(self, response = None, user = None, passphrase = None, test_branch = False):
         self.stream_iter = response.app_iter
@@ -179,7 +166,7 @@ class DecryptionIterable:
             while index < len(text):
                 yield text[index : index + chunk_size]
                 index += chunk_size
-                
+
         if self.stream_iter:
             if self.test_branch:
                 while True:
