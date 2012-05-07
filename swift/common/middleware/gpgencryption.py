@@ -145,7 +145,10 @@ class GPGDecrypt:
 class DecryptionIterable:
     def __init__(self, response = None, user = None, passphrase = None, test_branch = False):
         #self.passphrase = passphrase
-        self.passphrase = 'test-swift'
+        if not passphrase:
+            self.passphrase = 'test-swift'
+        else:
+            self.passphrase = passphrase
         self.chunk_size = 65536
         self.stream_iter = response.app_iter
         self.term_char = chr(0)
