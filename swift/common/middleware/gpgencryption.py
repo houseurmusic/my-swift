@@ -117,6 +117,7 @@ class GPGDecrypt:
         self.t.start()
 
     def _enqueue_output_(self, out, queue):
+        #block until size of chunk is read or close
         def readChunk():
             return out.read(self.chunk_size)
 
