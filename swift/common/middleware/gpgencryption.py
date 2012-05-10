@@ -37,6 +37,8 @@ from swift.common.exceptions import ChunkReadTimeout, \
 
 #TODO CHECK IF BUFFER IS BEING CLOSE!
 
+#CHUNK_SIZE MUST BE SHARED BETWEEN ALL CLASSES
+CHUNK_SIZE = 65536
 class GPGEncryption():
 
     def __init__(self, encrypt_or_decrypt, iterable = None, user = None, passphrase = None, test_branch = False):
@@ -45,6 +47,7 @@ class GPGEncryption():
         cmd = 'gpg -a -r ' + user + ' -e'
         #cmd = 'cat'
         self.term_char = chr(0)
+        self.chunk_size = CHUNK_SIZE
         self.stream_iter = iterable
         self.stream_iter_read = iterable.read
         self.gpg_closed = False
@@ -84,6 +87,7 @@ class GPGEncryption():
         self.p.stdin.close()
 
     def read(self, read_size):
+        read_size = self.chunk_size
         if self.first_read:
             self.first_read = False
             t = Thread(target = self.readFromStream, args = (read_size, ))
@@ -108,18 +112,21 @@ class GPGDecrypt:
         cmd = 'gpg -d --batch --passphrase-fd 0'
         ON_POSIX = 'posix' in sys.builtin_module_names
         self.passphrase = passphrase
-        self.chunk_size = chunk_size
-        self.p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds = ON_POSIX, bufsize = self.chunk_size)
+        #should be divisible by chunk_size:
+        self.buff_read_size = 4096
+        self.chunk_size = CHUNK_SIZE
+        self.p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds = ON_POSIX, bufsize = 4096)
         self.p.stdin.write(self.passphrase + '\n')
         self.q = Queue()
         self.t = Thread(target = self._enqueue_output_, args = (self.p.stdout, self.q))
         self.t.daemon = True
         self.t.start()
+        self.buffer = ''
 
     def _enqueue_output_(self, out, queue):
         #block until size of chunk is read or close
         def readChunk():
-            return out.read(self.chunk_size)
+            return out.read(self.buff_read_size)
 
         for chunk in iter(readChunk, b''):
             queue.put(chunk)
@@ -132,8 +139,21 @@ class GPGDecrypt:
     def has_buffer(self):
         return not self.q.empty()
 
-    def get_chunk(self, timeout = 0):
-        return self.q.get(timeout = timeout)
+    def get_chunk(self, chunk_size = None, timeout = 0):
+        chunk = self.q.get(timeout = timeout)
+        while True:
+            self.buffer += chunk
+            try:
+                chunk = self.q.get(timeout = .001)
+            except Empty:
+                break
+        if(len(self.buffer) >= chunk_size or self.p.stdin.closed):
+            chunk = self.buffer
+            self.buffer = ''
+        else:
+            chunk = ''
+        return chunk
+
 
     def close(self):
         self.p.stdin.close()
@@ -149,7 +169,7 @@ class DecryptionIterable:
             self.passphrase = 'test-swift'
         else:
             self.passphrase = passphrase
-        self.chunk_size = 65536
+        self.chunk_size = CHUNK_SIZE
         self.stream_iter = response.app_iter
         self.term_char = chr(0)
         self.cmd = 'gpg -d --batch --passphrase-fd 0'
@@ -163,32 +183,45 @@ class DecryptionIterable:
         while index < len(text):
             yield text[index : index + chunk_size]
             index += chunk_size
-    
+
+
     def __iter__(self):
         gpg = GPGDecrypt(self.passphrase, self.chunk_size)
         print 'after init'
+        iter_done = False
+        chunk = ''
         while True:
             try:
                 chunk = self.stream_iter.next()
+                #print 'read chunk = ' + chunk
             except StopIteration:
                 print 'stop iter exception reached'
-                break
-            if chunk[len(chunk) - 1] == self.term_char:
-                chunk = chunk.rstrip(self.term_char)
-                gpg.digest(chunk)
-                gpg.close()
-                d_chunk = gpg.get_chunk(.01)
-                #print 'd_chunk = ' + d_chunk
-                yield d_chunk
-                while gpg.has_buffer():
-                    d_chunk = gpg.get_chunk(.01)
+                iter_done = True
+            if not iter_done:
+                if chunk[len(chunk) - 1] == self.term_char:
+                    chunk = chunk.rstrip(self.term_char)
+                    gpg.digest(chunk)
+                    gpg.close()
+                    d_chunk = gpg.get_chunk(timeout = .01)
+                    print 'd_chunk = ' + d_chunk
                     yield d_chunk
-                gpg = GPGDecrypt(self.passphrase, self.chunk_size)
+                    print 'here'
+                    while gpg.has_buffer():
+                        print 'here'
+                        d_chunk = gpg.get_chunk(timeout = .01)
+                        yield d_chunk
+                    print 'here'
+                    if iter_done:
+                        break
+                    else:
+                        gpg = GPGDecrypt(self.passphrase, self.chunk_size)
+                else:
+                    gpg.digest(chunk)
+                    if(gpg.has_buffer()):
+                        d_chunk = gpg.get_chunk()
+                        yield d_chunk
             else:
-                gpg.digest(chunk)
-                if(gpg.has_buffer()):
-                    d_chunk = gpg.get_chunk()
-                    yield d_chunk
+                break
                 
 
 
