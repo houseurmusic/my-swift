@@ -38,7 +38,7 @@ from swift.common.exceptions import ChunkReadTimeout, \
 #TODO CHECK IF BUFFER IS BEING CLOSE!
 
 #CHUNK_SIZE MUST BE SHARED BETWEEN ALL CLASSES
-CHUNK_SIZE = 65536
+CHUNK_SIZE = 4096
 class GPGEncryption():
 
     def __init__(self, encrypt_or_decrypt, iterable = None, user = None, passphrase = None, test_branch = False):
@@ -203,14 +203,11 @@ class DecryptionIterable:
                     gpg.digest(chunk)
                     gpg.close()
                     d_chunk = gpg.get_chunk(timeout = .01)
-                    print 'd_chunk = ' + d_chunk
                     yield d_chunk
                     print 'here'
                     while gpg.has_buffer():
-                        print 'here'
                         d_chunk = gpg.get_chunk(timeout = .01)
                         yield d_chunk
-                    print 'here'
                     if iter_done:
                         break
                     else:
