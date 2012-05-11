@@ -38,7 +38,7 @@ from swift.common.exceptions import ChunkReadTimeout, \
 #TODO CHECK IF BUFFER IS BEING CLOSE!
 
 #CHUNK_SIZE MUST BE SHARED BETWEEN ALL CLASSES
-CHUNK_SIZE = 4096
+CHUNK_SIZE = 65536
 class GPGEncryption():
 
     def __init__(self, encrypt_or_decrypt, iterable = None, user = None, passphrase = None, test_branch = False):
@@ -56,7 +56,7 @@ class GPGEncryption():
         self.first_read = True
         #shared variable between threads
         self.finished_write = False
-        self.p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds = True, bufsize = 4096)
+        self.p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds = True, bufsize = CHUNK_SIZE)
 
         self.my_buffer = ''
         self.finished_write = False
@@ -113,20 +113,21 @@ class GPGDecrypt:
         ON_POSIX = 'posix' in sys.builtin_module_names
         self.passphrase = passphrase
         #should be divisible by chunk_size:
-        self.buff_read_size = 4096
+        self.buff_read_size = CHUNK_SIZE
         self.chunk_size = CHUNK_SIZE
-        self.p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds = ON_POSIX, bufsize = 4096)
+        self.p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=PIPE, close_fds = True, bufsize = CHUNK_SIZE)
         self.p.stdin.write(self.passphrase + '\n')
         self.q = Queue()
         self.t = Thread(target = self._enqueue_output_, args = (self.p.stdout, self.q))
         self.t.daemon = True
         self.t.start()
         self.buffer = ''
-
+        self.count = 0
     def _enqueue_output_(self, out, queue):
         #block until size of chunk is read or close
         def readChunk():
             return out.read(self.buff_read_size)
+            #return out.readline()
 
         for chunk in iter(readChunk, b''):
             queue.put(chunk)
@@ -135,23 +136,9 @@ class GPGDecrypt:
     def digest(self, chunk):
         self.p.stdin.write(chunk)
         self.p.stdin.flush()
-
-    def has_buffer(self):
-        return not self.q.empty()
-
+        
     def get_chunk(self, chunk_size = None, timeout = 0):
-        chunk = self.q.get(timeout = timeout)
-        while True:
-            self.buffer += chunk
-            try:
-                chunk = self.q.get(timeout = .001)
-            except Empty:
-                break
-        if(len(self.buffer) >= chunk_size or self.p.stdin.closed):
-            chunk = self.buffer
-            self.buffer = ''
-        else:
-            chunk = ''
+        chunk = self.q.get(timeout = .01)
         return chunk
 
 
@@ -160,6 +147,9 @@ class GPGDecrypt:
 
     def has_buffer(self):
         return not self.q.empty()
+
+    def done(self):
+        return self.p.stdout.closed and self.q.empty()
 
     
 class DecryptionIterable:
@@ -202,24 +192,20 @@ class DecryptionIterable:
                     chunk = chunk.rstrip(self.term_char)
                     gpg.digest(chunk)
                     gpg.close()
-                    d_chunk = gpg.get_chunk(timeout = .01)
-                    yield d_chunk
-                    print 'here'
-                    while gpg.has_buffer():
-                        d_chunk = gpg.get_chunk(timeout = .01)
-                        yield d_chunk
-                    if iter_done:
-                        break
-                    else:
-                        gpg = GPGDecrypt(self.passphrase, self.chunk_size)
-                else:
-                    gpg.digest(chunk)
-                    if(gpg.has_buffer()):
+                    while(not gpg.done()):
                         d_chunk = gpg.get_chunk()
                         yield d_chunk
+                    gpg = GPGDecrypt(self.passphrase, self.chunk_size)
+                else:
+                    gpg.digest(chunk)
+                    d_chunk = gpg.get_chunk()
+                    yield d_chunk
             else:
+                while(gpg.has_buffer()):
+                    d_chunk = gpg.get_chunk()
+                    print d_chunk
+                    yield d_chunk
                 break
-                
 
 
 
