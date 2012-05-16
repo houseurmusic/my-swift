@@ -121,6 +121,7 @@ class GPGDecrypt:
         self.t = Thread(target = self._enqueue_output_, args = (self.p.stdout, self.q))
         self.t.daemon = True
         self.t.start()
+        self.semaphore = threading.BoundedSemaphore()
         self.buffer = ''
         self.count = 0
     def _enqueue_output_(self, out, queue):
@@ -131,14 +132,20 @@ class GPGDecrypt:
 
         for chunk in iter(readChunk, b''):
             queue.put(chunk)
+        self.semaphore.acquire()
+        #print 'DONE READING!'
         out.close()
+        self.semaphore.release()
 
     def digest(self, chunk):
         self.p.stdin.write(chunk)
         self.p.stdin.flush()
         
     def get_chunk(self, chunk_size = None, timeout = 0):
-        chunk = self.q.get(timeout = .01)
+        try:
+            chunk = self.q.get(timeout = .01)
+        except Empty:
+            return ''
         return chunk
 
 
@@ -149,7 +156,13 @@ class GPGDecrypt:
         return not self.q.empty()
 
     def done(self):
-        return self.p.stdout.closed and self.q.empty()
+        print 'in done'
+        self.semaphore.acquire()
+        closed = self.p.stdout.closed
+        self.semaphore.release()
+        print closed
+        print self.q.empty()
+        return closed and self.q.empty()
 
     
 class DecryptionIterable:
@@ -168,6 +181,7 @@ class DecryptionIterable:
     def next(self):
         return iter(self).next()
 
+    #need to optimize this!
     def stringIterate(self, text, chunk_size):
         index = 0
         while index < len(text):
@@ -183,28 +197,29 @@ class DecryptionIterable:
         while True:
             try:
                 chunk = self.stream_iter.next()
-                #print 'read chunk = ' + chunk
+                print 'read chunk size = ' + str(len(chunk))
             except StopIteration:
                 print 'stop iter exception reached'
                 iter_done = True
             if not iter_done:
                 if chunk[len(chunk) - 1] == self.term_char:
-                    chunk = chunk.rstrip(self.term_char)
                     gpg.digest(chunk)
                     gpg.close()
                     while(not gpg.done()):
                         d_chunk = gpg.get_chunk()
-                        yield d_chunk
+                        if d_chunk:
+                            yield d_chunk
                     gpg = GPGDecrypt(self.passphrase, self.chunk_size)
                 else:
                     gpg.digest(chunk)
                     d_chunk = gpg.get_chunk()
-                    yield d_chunk
+                    if d_chunk:
+                        yield d_chunk
             else:
                 while(gpg.has_buffer()):
                     d_chunk = gpg.get_chunk()
-                    print d_chunk
-                    yield d_chunk
+                    if d_chunk:
+                        yield d_chunk
                 break
 
 
