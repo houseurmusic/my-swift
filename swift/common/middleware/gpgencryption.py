@@ -43,9 +43,9 @@ class GPGEncryption():
 
     def __init__(self, encrypt_or_decrypt, iterable = None, user = None, passphrase = None, test_branch = False):
         self.test_branch = test_branch
-        print 'initing gpg'
         cmd = 'gpg -a -r ' + user + ' -e'
         #cmd = 'cat'
+        self.total_sent = 0
         self.term_char = chr(0)
         self.chunk_size = CHUNK_SIZE
         self.stream_iter = iterable
@@ -69,6 +69,7 @@ class GPGEncryption():
 
     def stringIterate(self, text, chunk_size):
         index = 0
+
         while index < len(text):
             yield text[index : index + chunk_size]
             index += chunk_size
@@ -95,7 +96,8 @@ class GPGEncryption():
         chunk = self.p.stdout.read(read_size)
         if chunk and len(chunk) < read_size:
             chunk = self.padder(chunk, read_size)
-        #print 'returning chunk = ' + chunk
+        self.total_sent += len(chunk)
+        #print 'returning chunk = ' + str(len(chunk))
         return chunk
 
 #queue code from:
@@ -156,12 +158,9 @@ class GPGDecrypt:
         return not self.q.empty()
 
     def done(self):
-        print 'in done'
         self.semaphore.acquire()
         closed = self.p.stdout.closed
         self.semaphore.release()
-        print closed
-        print self.q.empty()
         return closed and self.q.empty()
 
     
@@ -191,15 +190,12 @@ class DecryptionIterable:
 
     def __iter__(self):
         gpg = GPGDecrypt(self.passphrase, self.chunk_size)
-        print 'after init'
         iter_done = False
         chunk = ''
         while True:
             try:
                 chunk = self.stream_iter.next()
-                print 'read chunk size = ' + str(len(chunk))
             except StopIteration:
-                print 'stop iter exception reached'
                 iter_done = True
             if not iter_done:
                 if chunk[len(chunk) - 1] == self.term_char:
